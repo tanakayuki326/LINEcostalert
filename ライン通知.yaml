@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'LINE notification cost alert API (CloudFormation / Tokyo Region)'
+
+Parameters:
+  LineAccessToken:
+    Type: String
+    Description: LINE channel access token (for Messaging API)
+
+  LineUserId:
+    Type: String
+    Description: LINE user ID 
+
+Resources:
+  # Lambda
+  LineCostNotifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AWS_Cost_To_LINE
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          LINE_ACCESS_TOKEN: !Ref LineAccessToken
+          LINE_USER_ID: !Ref LineUserId
+      Code:
+        ZipFile: |
+          # -*- coding: utf-8 -*-
+          import json
+          import boto3
+          from datetime import datetime
+          import os
+          import urllib.request
+
+          ce = boto3.client("ce")
+
+          def get_monthly_cost():
+              now = datetime.utcnow()
+              start_date = now.replace(day=1).strftime("%Y-%m-%d")
+              end_date = now.strftime("%Y-%m-%d")
+              response = ce.get_cost_and_usage(
+                  TimePeriod={"Start": start_date, "End": end_date},
+                  Granularity="MONTHLY",
+                  Metrics=["UnblendedCost"]
+              )
+              cost = float(response["ResultsByTime"][0]["Total"]["UnblendedCost"]["Amount"])
+              return cost
+
+          def reply_to_user(token, message):
+              url = "https://api.line.me/v2/bot/message/reply"
+              headers = {
+                  "Authorization": f"Bearer {os.environ['LINE_ACCESS_TOKEN']}",
+                  "Content-Type": "application/json"
+              }
+              data = {
+                  "replyToken": token,
+                  "messages": [{"type": "text", "text": message}]
+              }
+              req = urllib.request.Request(url, data=json.dumps(data, ensure_ascii=False).encode('utf-8'), headers=headers)
+              with urllib.request.urlopen(req) as res:
+                  return res.read().decode('utf-8')
+
+          def send_line_message(message):
+              url = "https://api.line.me/v2/bot/message/push"
+              headers = {
+                  "Authorization": f"Bearer {os.environ['LINE_ACCESS_TOKEN']}",
+                  "Content-Type": "application/json"
+              }
+              data = {
+                  "to": os.environ['LINE_USER_ID'],
+                  "messages": [{"type": "text", "text": message}]
+              }
+              req = urllib.request.Request(url, data=json.dumps(data, ensure_ascii=False).encode('utf-8'), headers=headers)
+              with urllib.request.urlopen(req) as res:
+                  return res.read().decode('utf-8')
+
+          def lambda_handler(event, context):
+              print("=== EVENT START ===")
+              print(json.dumps(event, ensure_ascii=False))
+              print("=== EVENT END ===")
+
+              try:
+                  body = json.loads(event["body"]) if "body" in event else {}
+                  if "events" in body:
+                      for e in body["events"]:
+                          if e["type"] == "message" and "text" in e["message"]:
+                              cost = get_monthly_cost()
+                              message = f"今月のAWS利用料金 ${cost:.2f} "
+                              reply_to_user(e["replyToken"], message)
+                      return {
+                          "statusCode": 200,
+                          "body": json.dumps({"message": "Webhook handled"}, ensure_ascii=False)
+                      }
+              except Exception as e:
+                  print("Error:", str(e))
+
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({"message": "No valid event received"}, ensure_ascii=False)
+              }
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: InlineLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InlineLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ApiGateway:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: LineCostAPI
+      ProtocolType: HTTP
+
+  ApiGatewayIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGateway
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LineCostNotifierFunction}
+      PayloadFormatVersion: '2.0'
+
+  ApiGatewayRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGateway
+      RouteKey: ANY /AWS_Cost_To_LINE
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref ApiGatewayIntegration
+
+  ApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LineCostNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/AWS_Cost_To_LINE
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn: ApiGatewayRoute
+    Properties:
+      ApiId: !Ref ApiGateway
+
+  ApiGatewayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiGateway
+      StageName: prod
+      DeploymentId: !Ref ApiGatewayDeployment
+
+Outputs:
+  WebhookURLEndpoint:
+    Description: Webhook URL Endpoint
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/AWS_Cost_To_LINE
